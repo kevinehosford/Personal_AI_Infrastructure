@@ -1,8 +1,8 @@
 /**
  * storage.ts — SQLite-backed storage layer for PAI MEMORY.
  *
- * Replaces filesystem-based MEMORY I/O with a single bun:sqlite database.
- * WAL mode enabled for Litestream replication compatibility and concurrent reads.
+ * Uses libsql for Turso embedded replica support.
+ * WAL mode enabled for replication compatibility and concurrent reads.
  *
  * Usage:
  *   import { getDb, readState, writeState } from './lib/storage';
@@ -10,7 +10,8 @@
  *   const identity = readState('STATE', 'identity');
  */
 
-import { Database } from "bun:sqlite";
+import Database from "libsql";
+type DatabaseInstance = InstanceType<typeof Database>;
 import { getMemoryDir } from "./paths";
 import { join } from "path";
 import { mkdirSync, existsSync } from "fs";
@@ -97,13 +98,13 @@ CREATE TABLE IF NOT EXISTS learnings (
 
 // ── Singleton ──
 
-let _db: Database | null = null;
+let _db: DatabaseInstance | null = null;
 
 /**
  * Initialize the database. Call once; idempotent.
  * Enables WAL mode for Litestream compatibility and concurrent reads.
  */
-export function initDb(dbPath?: string): Database {
+export function initDb(dbPath?: string): DatabaseInstance {
   if (_db) {
     _db.close();
     _db = null;
@@ -119,9 +120,27 @@ export function initDb(dbPath?: string): Database {
     }
   }
 
-  _db = new Database(resolvedPath);
+  // Build constructor options for Turso embedded replica support
+  const opts: Record<string, unknown> = {};
+  const syncUrl = process.env.TURSO_DATABASE_URL;
+  const authToken = process.env.TURSO_AUTH_TOKEN;
+  if (syncUrl && authToken && resolvedPath !== ":memory:") {
+    opts.syncUrl = syncUrl;
+    opts.authToken = authToken;
+  }
+
+  _db = new Database(resolvedPath, opts);
   _db.exec("PRAGMA journal_mode=WAL");
   _db.exec(SCHEMA);
+
+  // Pull latest from Turso on startup
+  if (opts.syncUrl) {
+    try {
+      (_db as any).sync();
+    } catch (e) {
+      // First run — no remote data yet, that's fine
+    }
+  }
 
   return _db;
 }
@@ -129,7 +148,7 @@ export function initDb(dbPath?: string): Database {
 /**
  * Get the singleton database instance. Lazily initializes if needed.
  */
-export function getDb(): Database {
+export function getDb(): DatabaseInstance {
   if (!_db) {
     initDb();
   }
@@ -140,9 +159,34 @@ export function getDb(): Database {
  * Close and reset the singleton. Used by tests for cleanup.
  */
 export function resetDb(): void {
+  stopAutoSync();
   if (_db) {
     _db.close();
     _db = null;
+  }
+}
+
+/** Pull latest changes from Turso cloud */
+export function syncDb(): void {
+  if (_db && process.env.TURSO_DATABASE_URL) {
+    (_db as any).sync();
+  }
+}
+
+/** Start periodic background sync */
+let _syncInterval: Timer | null = null;
+
+export function startAutoSync(intervalMs = 30_000): void {
+  if (_syncInterval) return;
+  _syncInterval = setInterval(() => {
+    try { syncDb(); } catch { /* non-critical */ }
+  }, intervalMs);
+}
+
+export function stopAutoSync(): void {
+  if (_syncInterval) {
+    clearInterval(_syncInterval);
+    _syncInterval = null;
   }
 }
 
