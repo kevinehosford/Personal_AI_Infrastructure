@@ -20,6 +20,7 @@ import { readFileSync, writeFileSync, readdirSync, existsSync, statSync } from '
 import { join } from 'path';
 import { execSync } from 'child_process';
 import { getPaiDir, getSettingsPath } from '../lib/paths';
+import { writeState, queryLogs } from '../lib/storage';
 
 interface Counts {
   skills: number;
@@ -147,7 +148,9 @@ function countSubdirs(dir: string): number {
  * Get all counts
  */
 function getCounts(paiDir: string): Counts {
-  const ratingsPath = join(paiDir, 'MEMORY/LEARNING/SIGNALS/ratings.jsonl');
+  // Ratings count now comes from SQLite logs table
+  const ratingsCount = queryLogs('ratings').length;
+
   return {
     skills: countSkills(paiDir),
     workflows: countWorkflowFiles(join(paiDir, 'skills')),
@@ -158,7 +161,7 @@ function getCounts(paiDir: string): Counts {
     sessions: countFilesRecursive(join(paiDir, 'MEMORY'), '.jsonl'),
     research: countFilesRecursive(join(paiDir, 'MEMORY/RESEARCH'), '.md') +
               countFilesRecursive(join(paiDir, 'MEMORY/RESEARCH'), '.json'),
-    ratings: countRatingsLines(ratingsPath),
+    ratings: ratingsCount,
     updatedAt: new Date().toISOString(),
   };
 }
@@ -168,8 +171,6 @@ function getCounts(paiDir: string): Counts {
  * Called by stop hook so status line never needs to make this 700ms API call.
  */
 async function refreshUsageCache(paiDir: string): Promise<void> {
-  const usageCachePath = join(paiDir, 'MEMORY/STATE/usage-cache.json');
-
   try {
     // Extract OAuth token from macOS Keychain
     const keychainData = execSync(
@@ -234,7 +235,8 @@ async function refreshUsageCache(paiDir: string): Promise<void> {
       }
     }
 
-    writeFileSync(usageCachePath, JSON.stringify(data, null, 2) + '\n');
+    // Write usage cache to SQLite state store
+    writeState('usage-cache', 'anthropic-usage', data);
     console.error(`[UpdateCounts] Usage cache refreshed: 5H=${(data.five_hour as any)?.utilization}% 7D=${(data.seven_day as any)?.utilization}%`);
   } catch {
     // Non-fatal — status line falls back to stale cache

@@ -41,13 +41,14 @@
  * - Removes ~200 lines of duplicated code (shared writeRating, captureLearning, trending)
  */
 
-import { appendFileSync, mkdirSync, existsSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { inference } from '../skills/PAI/Tools/Inference';
 import { getIdentity, getPrincipal, getPrincipalName } from './lib/identity';
 import { getLearningCategory } from './lib/learning-utils';
 import { getISOTimestamp, getPSTComponents } from './lib/time';
 import { captureFailure } from '../skills/PAI/Tools/FailureCapture';
+import { appendLog, createLearning } from './lib/storage';
 
 // ── Algorithm Format Reminder (absorbed from AlgorithmEnforcement) ──
 // Output IMMEDIATELY before any async work — this is blocking stdout injection.
@@ -99,8 +100,6 @@ interface RatingEntry {
 // ── Shared Constants ──
 
 const BASE_DIR = process.env.PAI_DIR || join(process.env.HOME!, '.claude');
-const SIGNALS_DIR = join(BASE_DIR, 'MEMORY', 'LEARNING', 'SIGNALS');
-const RATINGS_FILE = join(SIGNALS_DIR, 'ratings.jsonl');
 const TRENDING_SCRIPT = join(BASE_DIR, 'tools', 'TrendingAnalysis.ts');
 const MIN_PROMPT_LENGTH = 3;
 const MIN_CONFIDENCE = 0.5;
@@ -278,10 +277,9 @@ async function analyzeSentiment(prompt: string, context: string): Promise<Sentim
 // ── Shared: Write Rating ──
 
 function writeRating(entry: RatingEntry): void {
-  if (!existsSync(SIGNALS_DIR)) mkdirSync(SIGNALS_DIR, { recursive: true });
-  appendFileSync(RATINGS_FILE, JSON.stringify(entry) + '\n', 'utf-8');
+  appendLog('ratings', entry);
   const source = entry.source === 'implicit' ? 'implicit' : 'explicit';
-  console.error(`[RatingCapture] Wrote ${source} rating ${entry.rating} to ${RATINGS_FILE}`);
+  console.error(`[RatingCapture] Wrote ${source} rating ${entry.rating} to SQLite`);
 }
 
 // ── Shared: Trigger Trending Analysis ──
@@ -305,15 +303,7 @@ function captureLowRatingLearning(
   if (!detailedContext?.trim()) return;  // Skip if no meaningful context to learn from
 
   const { year, month, day, hours, minutes, seconds } = getPSTComponents();
-  const yearMonth = `${year}-${month}`;
   const category = getLearningCategory(detailedContext, summaryOrComment);
-  const learningsDir = join(BASE_DIR, 'MEMORY', 'LEARNING', category, yearMonth);
-
-  if (!existsSync(learningsDir)) mkdirSync(learningsDir, { recursive: true });
-
-  const label = source === 'explicit' ? `low-rating-${rating}` : `sentiment-rating-${rating}`;
-  const filename = `${year}-${month}-${day}-${hours}${minutes}${seconds}_LEARNING_${label}.md`;
-  const filepath = join(learningsDir, filename);
 
   const tags = source === 'explicit'
     ? '[low-rating, improvement-opportunity]'
@@ -350,8 +340,15 @@ This response was rated ${rating}/10 by ${getPrincipalName()}. Use this as an im
 ---
 `;
 
-  writeFileSync(filepath, content, 'utf-8');
-  console.error(`[RatingCapture] Captured low ${source} rating learning to ${filepath}`);
+  const label = source === 'explicit' ? `low-rating-${rating}` : `sentiment-rating-${rating}`;
+  createLearning({
+    category,
+    source: label,
+    title: `${source === 'explicit' ? 'Low Rating' : 'Implicit Low Rating'}: ${rating}/10`,
+    content,
+  });
+
+  console.error(`[RatingCapture] Captured low ${source} rating learning to SQLite`);
 }
 
 // ── Main ──

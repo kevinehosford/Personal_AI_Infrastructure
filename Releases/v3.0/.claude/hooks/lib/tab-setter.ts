@@ -8,14 +8,16 @@
  * All hooks call setTabState() instead of directly running kitten commands.
  */
 
-import { existsSync, writeFileSync, mkdirSync, readdirSync, unlinkSync, readFileSync } from 'fs';
-import { join } from 'path';
+import { existsSync } from 'fs';
 import { execSync } from 'child_process';
 import { TAB_COLORS, PHASE_TAB_CONFIG, ACTIVE_TAB_BG, ACTIVE_TAB_FG, INACTIVE_TAB_FG, type TabState, type AlgorithmTabPhase } from './tab-constants';
 import { paiPath } from './paths';
-
-const TAB_TITLES_DIR = paiPath('MEMORY', 'STATE', 'tab-titles');
-const KITTY_SESSIONS_DIR = paiPath('MEMORY', 'STATE', 'kitty-sessions');
+import {
+  readState as storageRead,
+  writeState as storageWrite,
+  deleteState as storageDelete,
+  listKeys,
+} from './storage';
 
 /**
  * Get Kitty environment from env vars or persisted per-session file.
@@ -35,12 +37,11 @@ function getKittyEnv(sessionId?: string): { listenOn: string | null; windowId: s
   let windowId = process.env.KITTY_WINDOW_ID || null;
   if (listenOn && windowId) return { listenOn, windowId };
 
-  // Per-session file lookup (preferred — no shared mutable state)
+  // Per-session lookup from SQLite (preferred — no shared mutable state)
   if (sessionId) {
     try {
-      const sessionPath = join(KITTY_SESSIONS_DIR, `${sessionId}.json`);
-      if (existsSync(sessionPath)) {
-        const entry = JSON.parse(readFileSync(sessionPath, 'utf-8'));
+      const entry = storageRead<{ listenOn: string; windowId: string }>('kitty-sessions', sessionId);
+      if (entry) {
         listenOn = listenOn || entry.listenOn || null;
         windowId = windowId || entry.windowId || null;
         if (listenOn && windowId) return { listenOn, windowId };
@@ -62,7 +63,7 @@ function getKittyEnv(sessionId?: string): { listenOn: string | null; windowId: s
 
   // Log when kitty env lookup fails with a session ID (diagnostic for compaction issues)
   if (sessionId && !listenOn && !windowId) {
-    console.error(`[tab-setter] getKittyEnv: no kitty env found for session ${sessionId.slice(0, 8)} (no env vars, no session file, no default socket)`);
+    console.error(`[tab-setter] getKittyEnv: no kitty env found for session ${sessionId.slice(0, 8)} (no env vars, no session entry, no default socket)`);
   }
 
   return { listenOn, windowId };
@@ -80,23 +81,17 @@ function getKittyEnv(sessionId?: string): { listenOn: string | null; windowId: s
  */
 export function persistKittySession(sessionId: string, listenOn: string, windowId: string): void {
   try {
-    if (!existsSync(KITTY_SESSIONS_DIR)) mkdirSync(KITTY_SESSIONS_DIR, { recursive: true });
-    writeFileSync(
-      join(KITTY_SESSIONS_DIR, `${sessionId}.json`),
-      JSON.stringify({ listenOn, windowId }),
-      'utf-8'
-    );
+    storageWrite('kitty-sessions', sessionId, { listenOn, windowId });
   } catch { /* silent */ }
 }
 
 /**
- * Remove a session's persisted Kitty environment file.
+ * Remove a session's persisted Kitty environment from SQLite.
  * Called by SessionSummary at session end.
  */
 export function cleanupKittySession(sessionId: string): void {
   try {
-    const sessionPath = join(KITTY_SESSIONS_DIR, `${sessionId}.json`);
-    if (existsSync(sessionPath)) unlinkSync(sessionPath);
+    storageDelete('kitty-sessions', sessionId);
   } catch { /* silent */ }
 }
 
@@ -108,14 +103,13 @@ interface SetTabOptions {
 }
 
 /**
- * Clean up state files for kitty windows that no longer exist.
+ * Clean up tab-title entries for kitty windows that no longer exist.
  * Runs opportunistically on each setTabState call (lightweight).
  */
-function cleanupStaleStateFiles(): void {
+function cleanupStaleStateEntries(): void {
   try {
-    if (!existsSync(TAB_TITLES_DIR)) return;
-    const files = readdirSync(TAB_TITLES_DIR).filter(f => f.endsWith('.json'));
-    if (files.length === 0) return;
+    const keys = listKeys('tab-titles');
+    if (keys.length === 0) return;
 
     // Get live window IDs from kitty via socket (prevents escape sequence leaks)
     const defaultSocket = `/tmp/kitty-${process.env.USER}`;
@@ -128,10 +122,9 @@ function cleanupStaleStateFiles(): void {
 
     const liveIds = new Set(liveOutput.split('\n').map(id => id.trim()));
 
-    for (const file of files) {
-      const winId = file.replace('.json', '');
+    for (const winId of keys) {
       if (!liveIds.has(winId)) {
-        try { unlinkSync(join(TAB_TITLES_DIR, file)); } catch { /* silent */ }
+        try { storageDelete('tab-titles', winId); } catch { /* silent */ }
       }
     }
   } catch { /* silent — cleanup is best-effort */ }
@@ -189,11 +182,9 @@ export function setTabState(opts: SetTabOptions): void {
 
   try {
     if (state === 'idle') {
-      // Session ended — remove state file so no stale data lingers
-      const statePath = join(TAB_TITLES_DIR, `${windowId}.json`);
-      if (existsSync(statePath)) unlinkSync(statePath);
+      // Session ended — remove state entry so no stale data lingers
+      storageDelete('tab-titles', windowId);
     } else {
-      if (!existsSync(TAB_TITLES_DIR)) mkdirSync(TAB_TITLES_DIR, { recursive: true });
       const stateData: Record<string, unknown> = {
         title,
         inactiveBg: colors.inactiveBg,
@@ -201,12 +192,12 @@ export function setTabState(opts: SetTabOptions): void {
         timestamp: new Date().toISOString(),
       };
       if (previousTitle) stateData.previousTitle = previousTitle;
-      writeFileSync(join(TAB_TITLES_DIR, `${windowId}.json`), JSON.stringify(stateData), 'utf-8');
+      storageWrite('tab-titles', windowId, stateData);
     }
   } catch { /* silent */ }
 
-  // Opportunistic cleanup of stale state files for dead windows
-  cleanupStaleStateFiles();
+  // Opportunistic cleanup of stale entries for dead windows
+  cleanupStaleStateEntries();
 }
 
 /**
@@ -217,14 +208,13 @@ export function readTabState(sessionId?: string): { title: string; state: TabSta
   const windowId = kittyEnv.windowId;
   if (!windowId) return null;
   try {
-    const statePath = join(TAB_TITLES_DIR, `${windowId}.json`);
-    if (!existsSync(statePath)) return null;
-    const raw = JSON.parse(require('fs').readFileSync(statePath, 'utf-8'));
+    const raw = storageRead<Record<string, unknown>>('tab-titles', windowId);
+    if (!raw) return null;
     return {
-      title: raw.title || '',
-      state: raw.state || 'idle',
-      previousTitle: raw.previousTitle,
-      phase: raw.phase,
+      title: (raw.title as string) || '',
+      state: (raw.state as TabState) || 'idle',
+      previousTitle: raw.previousTitle as string | undefined,
+      phase: raw.phase as string | undefined,
     };
   } catch { return null; }
 }
@@ -251,9 +241,8 @@ const SESSION_NOISE = new Set([
  */
 export function getSessionOneWord(sessionId: string): string | null {
   try {
-    const namesPath = paiPath('MEMORY', 'STATE', 'session-names.json');
-    if (!existsSync(namesPath)) return null;
-    const names = JSON.parse(readFileSync(namesPath, 'utf-8'));
+    const names = storageRead<Record<string, string>>('session-names', 'map');
+    if (!names) return null;
     const fullName = names[sessionId];
     if (!fullName) return null;
 
@@ -346,18 +335,17 @@ export function setPhaseTab(phase: AlgorithmTabPhase, sessionId: string, summary
     console.error(`[tab-setter] Error setting phase tab:`, err);
   }
 
-  // Persist per-window state
+  // Persist per-window state to SQLite
   const windowId = kittyEnv.windowId;
   if (!windowId) return;
 
   try {
-    if (!existsSync(TAB_TITLES_DIR)) mkdirSync(TAB_TITLES_DIR, { recursive: true });
-    writeFileSync(join(TAB_TITLES_DIR, `${windowId}.json`), JSON.stringify({
+    storageWrite('tab-titles', windowId, {
       title,
       inactiveBg: config.inactiveBg,
       state: phase === 'COMPLETE' ? 'completed' : 'working',
       phase,
       timestamp: new Date().toISOString(),
-    }), 'utf-8');
+    });
   } catch { /* silent */ }
 }

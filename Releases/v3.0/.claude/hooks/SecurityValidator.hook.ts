@@ -60,11 +60,12 @@
  * - All decisions logged for audit trail
  */
 
-import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'fs';
+import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { parse as parseYaml } from 'yaml';
 import { paiPath } from './lib/paths';
+import { appendLog } from './lib/storage';
 
 // ========================================
 // Security Event Logging
@@ -85,49 +86,9 @@ interface SecurityEvent {
   action_taken: string;
 }
 
-function generateEventSummary(event: SecurityEvent): string {
-  // Create a 6-word-max slug from event type and target/reason
-  const eventWord = event.event_type; // block, confirm, alert, allow
-
-  // Extract key words from target or reason
-  const source = event.reason || event.target || 'unknown';
-  const words = source
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, ' ')  // Remove special chars
-    .split(/\s+/)
-    .filter(w => w.length > 1)     // Skip tiny words
-    .slice(0, 5);                   // Max 5 words (+ event type = 6)
-
-  return [eventWord, ...words].join('-');
-}
-
-function getSecurityLogPath(event: SecurityEvent): string {
-  const now = new Date();
-  const year = now.getFullYear().toString();
-  const month = (now.getMonth() + 1).toString().padStart(2, '0');
-  const day = now.getDate().toString().padStart(2, '0');
-  const hour = now.getHours().toString().padStart(2, '0');
-  const min = now.getMinutes().toString().padStart(2, '0');
-  const sec = now.getSeconds().toString().padStart(2, '0');
-
-  const summary = generateEventSummary(event);
-  const timestamp = `${year}${month}${day}-${hour}${min}${sec}`;
-
-  return paiPath('MEMORY', 'SECURITY', year, month, `security-${summary}-${timestamp}.jsonl`);
-}
-
 function logSecurityEvent(event: SecurityEvent): void {
   try {
-    const logPath = getSecurityLogPath(event);
-    const dir = logPath.substring(0, logPath.lastIndexOf('/'));
-
-    // Ensure directory exists
-    if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true });
-    }
-
-    const content = JSON.stringify(event, null, 2);
-    writeFileSync(logPath, content);
+    appendLog('security', event);
   } catch {
     // Logging failure should not block operations
     console.error('Warning: Failed to log security event');

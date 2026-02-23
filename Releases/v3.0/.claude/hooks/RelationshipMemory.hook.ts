@@ -28,11 +28,12 @@
  * - O(c=0.85) @Principal: Appreciates when I admit mistakes early
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync } from 'fs';
+import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { getPaiDir } from './lib/paths';
 import { getISOTimestamp, getPSTComponents } from './lib/time';
 import { getDAName, getPrincipalName } from './lib/identity';
+import { appendLog } from './lib/storage';
 
 interface HookInput {
   session_id: string;
@@ -209,54 +210,12 @@ function analyzeForRelationship(entries: TranscriptEntry[]): RelationshipNote[] 
 }
 
 /**
- * Format notes for markdown
+ * Format a single note for storage
  */
-function formatNotes(notes: RelationshipNote[]): string {
-  if (notes.length === 0) return '';
-
-  const lines: string[] = [];
-  const { hours, minutes } = getPSTComponents();
-
-  lines.push(`\n## ${hours}:${minutes} PST\n`);
-
-  for (const note of notes) {
-    const entities = note.entities.join(' ');
-    const confidence = note.confidence ? `(c=${note.confidence.toFixed(2)})` : '';
-    lines.push(`- ${note.type}${confidence} ${entities}: ${note.content}`);
-  }
-
-  return lines.join('\n') + '\n';
-}
-
-/**
- * Ensure relationship memory directory exists
- */
-function ensureRelationshipDir(paiDir: string): string {
-  const { year, month, day } = getPSTComponents();
-  const monthDir = join(paiDir, 'MEMORY', 'RELATIONSHIP', `${year}-${month}`);
-
-  if (!existsSync(monthDir)) {
-    mkdirSync(monthDir, { recursive: true });
-  }
-
-  return join(monthDir, `${year}-${month}-${day}.md`);
-}
-
-/**
- * Initialize daily relationship file if needed
- */
-function initDailyFile(filepath: string): void {
-  if (existsSync(filepath)) return;
-
-  const { year, month, day } = getPSTComponents();
-  const header = `# Relationship Notes: ${year}-${month}-${day}
-
-*Auto-captured from sessions. Manual additions welcome.*
-
----
-`;
-
-  writeFileSync(filepath, header, 'utf-8');
+function formatNote(note: RelationshipNote): string {
+  const entities = note.entities.join(' ');
+  const confidence = note.confidence ? `(c=${note.confidence.toFixed(2)})` : '';
+  return `${note.type}${confidence} ${entities}: ${note.content}`;
 }
 
 async function main() {
@@ -286,15 +245,23 @@ async function main() {
       process.exit(0);
     }
 
-    // Write to daily relationship file
-    const paiDir = getPaiDir();
-    const filepath = ensureRelationshipDir(paiDir);
-    initDailyFile(filepath);
+    // Write relationship notes to SQLite log
+    const { year, month, day, hours, minutes } = getPSTComponents();
+    const date = `${year}-${month}-${day}`;
 
-    const formatted = formatNotes(notes);
-    appendFileSync(filepath, formatted, 'utf-8');
+    for (const note of notes) {
+      appendLog('relationship', {
+        date,
+        time: `${hours}:${minutes}`,
+        type: note.type,
+        entities: note.entities,
+        content: note.content,
+        confidence: note.confidence,
+        formatted: formatNote(note),
+      });
+    }
 
-    console.error(`[RelationshipMemory] Captured ${notes.length} notes to ${filepath}`);
+    console.error(`[RelationshipMemory] Captured ${notes.length} notes to SQLite`);
     process.exit(0);
 
   } catch (err) {

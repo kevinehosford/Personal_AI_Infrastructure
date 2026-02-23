@@ -50,27 +50,14 @@
  * - Typical execution: <100ms
  */
 
-import { writeFileSync, existsSync, readFileSync, mkdirSync } from 'fs';
-import { join, dirname } from 'path';
-import { getISOTimestamp, getPSTDate } from './lib/time';
+import { getISOTimestamp } from './lib/time';
 import { getLearningCategory } from './lib/learning-utils';
-
-const BASE_DIR = process.env.PAI_DIR || join(process.env.HOME!, '.claude');
-const MEMORY_DIR = join(BASE_DIR, 'MEMORY');
-const STATE_DIR = join(MEMORY_DIR, 'STATE');
-const WORK_DIR = join(MEMORY_DIR, 'WORK');
-const LEARNING_DIR = join(MEMORY_DIR, 'LEARNING');
-
-// Session-scoped state file lookup with legacy fallback
-function findStateFile(sessionId?: string): string | null {
-  if (sessionId) {
-    const scoped = join(STATE_DIR, `current-work-${sessionId}.json`);
-    if (existsSync(scoped)) return scoped;
-  }
-  const legacy = join(STATE_DIR, 'current-work.json');
-  if (existsSync(legacy)) return legacy;
-  return null;
-}
+import {
+  readState,
+  getWorkSession,
+  getWorkTasks,
+  createLearning,
+} from './lib/storage';
 
 interface CurrentWork {
   session_id: string;
@@ -83,121 +70,22 @@ interface CurrentWork {
 
 interface WorkMeta {
   id: string;
-  title: string;
+  title: string | null;
   created_at: string;
   completed_at: string | null;
   source: string;
   status: string;
-  session_id: string;
-  lineage: {
+  session_id: string | null;
+  lineage?: {
     tools_used: string[];
     files_changed: string[];
     agents_spawned: string[];
   };
 }
 
-function parseYaml(content: string): WorkMeta {
-  // Simple YAML parser for our specific format
-  const meta: any = {};
-  const lines = content.split('\n');
-  let currentKey = '';
-  let inArray = false;
-  let arrayKey = '';
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-
-    // Handle array items
-    if (trimmed.startsWith('- ') && inArray) {
-      const value = trimmed.slice(2).replace(/^["']|["']$/g, '');
-      if (arrayKey === 'lineage') {
-        // Nested array in lineage
-        const lastKey = Object.keys(meta.lineage).pop();
-        if (lastKey) meta.lineage[lastKey].push(value);
-      } else {
-        meta[arrayKey].push(value);
-      }
-      continue;
-    }
-
-    // Handle key: value pairs
-    const match = trimmed.match(/^([a-z_]+):\s*(.*)$/);
-    if (match) {
-      const [, key, value] = match;
-      currentKey = key;
-
-      if (key === 'lineage') {
-        meta.lineage = { tools_used: [], files_changed: [], agents_spawned: [] };
-        inArray = false;
-        continue;
-      }
-
-      if (value === '[]') {
-        if (meta.lineage) {
-          meta.lineage[key] = [];
-        } else {
-          meta[key] = [];
-        }
-        inArray = false;
-      } else if (value === '') {
-        if (meta.lineage && ['tools_used', 'files_changed', 'agents_spawned'].includes(key)) {
-          meta.lineage[key] = [];
-          arrayKey = 'lineage';
-          inArray = true;
-        } else {
-          meta[key] = [];
-          arrayKey = key;
-          inArray = true;
-        }
-      } else {
-        const cleanValue = value.replace(/^["']|["']$/g, '');
-        if (meta.lineage && ['tools_used', 'files_changed', 'agents_spawned'].includes(key)) {
-          meta.lineage[key] = cleanValue === 'null' ? [] : [cleanValue];
-        } else {
-          meta[key] = cleanValue === 'null' ? null : cleanValue;
-        }
-        inArray = false;
-      }
-    }
-  }
-
-  return meta as WorkMeta;
-}
-
-function getMonthDir(category: 'SYSTEM' | 'ALGORITHM'): string {
-  const now = new Date();
-  const year = now.getFullYear();
-  const month = String(now.getMonth() + 1).padStart(2, '0');
-
-  const monthDir = join(LEARNING_DIR, category, `${year}-${month}`);
-
-  if (!existsSync(monthDir)) {
-    mkdirSync(monthDir, { recursive: true });
-  }
-
-  return monthDir;
-}
-
-function writeLearning(workMeta: WorkMeta, idealContent: string): void {
-  const category = getLearningCategory(workMeta.title);
-  const monthDir = getMonthDir(category);
-
-  const dateStr = getPSTDate();
-  const timeStr = new Date().toISOString().split('T')[1].slice(0, 5).replace(':', '');
-  const titleSlug = workMeta.title
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .slice(0, 30);
-
-  const filename = `${dateStr}_${timeStr}_work_${titleSlug}.md`;
-  const filepath = join(monthDir, filename);
-
-  // Don't overwrite existing learnings
-  if (existsSync(filepath)) {
-    console.error(`[WorkCompletionLearning] Learning already exists: ${filename}`);
-    return;
-  }
+function writeLearningEntry(workMeta: WorkMeta, idealContent: string): void {
+  const title = workMeta.title || 'Untitled work';
+  const category = getLearningCategory(title);
 
   // Calculate session duration
   let duration = 'Unknown';
@@ -216,10 +104,10 @@ function writeLearning(workMeta: WorkMeta, idealContent: string): void {
 
   const content = `# Work Completion Learning
 
-**Title:** ${workMeta.title}
+**Title:** ${title}
 **Duration:** ${duration}
 **Category:** ${category}
-**Session:** ${workMeta.session_id}
+**Session:** ${workMeta.session_id || 'unknown'}
 
 ---
 
@@ -246,8 +134,14 @@ ${idealContent || 'Not specified'}
 *Auto-captured by WorkCompletionLearning hook at session end*
 `;
 
-  writeFileSync(filepath, content);
-  console.error(`[WorkCompletionLearning] Created learning: ${filename}`);
+  createLearning({
+    category,
+    source: 'work-completion',
+    title: `Work: ${title}`,
+    content,
+  });
+
+  console.error(`[WorkCompletionLearning] Created learning for: ${title}`);
 }
 
 async function main() {
@@ -268,19 +162,23 @@ async function main() {
       // Timeout or parse error — proceed without session_id
     }
 
-    // Check if there's an active work session (session-scoped with legacy fallback)
-    const stateFile = findStateFile(sessionId);
-    if (!stateFile) {
+    // Read current work state from SQLite (session-scoped with legacy fallback)
+    let currentWork: CurrentWork | null = null;
+    if (sessionId) {
+      currentWork = readState<CurrentWork>('current-work', sessionId);
+    }
+    if (!currentWork) {
+      currentWork = readState<CurrentWork>('current-work', 'legacy');
+    }
+
+    if (!currentWork) {
       console.error('[WorkCompletionLearning] No active work session');
       process.exit(0);
     }
 
-    // Read current work state
-    const currentWork: CurrentWork = JSON.parse(readFileSync(stateFile, 'utf-8'));
-
     // Guard: don't process another session's state
     if (sessionId && currentWork.session_id !== sessionId) {
-      console.error('[WorkCompletionLearning] State file belongs to different session, skipping');
+      console.error('[WorkCompletionLearning] State belongs to different session, skipping');
       process.exit(0);
     }
 
@@ -289,46 +187,53 @@ async function main() {
       process.exit(0);
     }
 
-    // Read work directory metadata
-    const workPath = join(WORK_DIR, currentWork.session_dir);
-    const metaPath = join(workPath, 'META.yaml');
+    // Read work session metadata from SQLite
+    const workSession = getWorkSession(currentWork.session_dir);
 
-    if (!existsSync(metaPath)) {
-      console.error('[WorkCompletionLearning] No META.yaml found');
+    if (!workSession) {
+      console.error('[WorkCompletionLearning] No work session found in database');
       process.exit(0);
     }
 
-    const metaContent = readFileSync(metaPath, 'utf-8');
-    const workMeta = parseYaml(metaContent);
+    // Build WorkMeta from the work session
+    const meta = (workSession.meta || {}) as Record<string, unknown>;
+    const workMeta: WorkMeta = {
+      id: workSession.id,
+      title: workSession.title,
+      created_at: workSession.createdAt,
+      completed_at: workSession.completedAt || getISOTimestamp(),
+      source: (meta.source as string) || 'AUTO',
+      status: workSession.status,
+      session_id: workSession.sessionId,
+      lineage: (meta.lineage as WorkMeta['lineage']) || undefined,
+    };
 
-    // Update completed_at if not set
-    if (!workMeta.completed_at) {
-      workMeta.completed_at = getISOTimestamp();
-    }
-
-    // Read ISC.json if it exists
-    const iscPath = join(workPath, 'ISC.json');
+    // Read ISC from work tasks
     let idealContent = '';
-    if (existsSync(iscPath)) {
-      try {
-        const iscData = JSON.parse(readFileSync(iscPath, 'utf-8'));
-        // Format ISC for human-readable learning
-        if (iscData.current?.criteria?.length > 0) {
-          idealContent = '**Criteria:**\n' + iscData.current.criteria.map((c: string) => `- ${c}`).join('\n');
+    const tasks = getWorkTasks(currentWork.session_dir);
+    if (tasks.length > 0) {
+      const criteria: string[] = [];
+      const antiCriteria: string[] = [];
+      for (const task of tasks) {
+        const isc = task.isc as Record<string, unknown> | null;
+        if (isc) {
+          if (Array.isArray(isc.criteria)) {
+            criteria.push(...(isc.criteria as string[]));
+          }
+          if (Array.isArray(isc.antiCriteria)) {
+            antiCriteria.push(...(isc.antiCriteria as string[]));
+          }
         }
-        if (iscData.current?.antiCriteria?.length > 0) {
-          idealContent += '\n\n**Anti-Criteria:**\n' + iscData.current.antiCriteria.map((c: string) => `- ${c}`).join('\n');
-        }
-        if (iscData.satisfaction) {
-          const s = iscData.satisfaction;
-          idealContent += `\n\n**Satisfaction:** ${s.satisfied}/${s.total} satisfied, ${s.partial} partial, ${s.failed} failed`;
-        }
-      } catch {
-        // Ignore parse errors
+      }
+      if (criteria.length > 0) {
+        idealContent = '**Criteria:**\n' + criteria.map((c: string) => `- ${c}`).join('\n');
+      }
+      if (antiCriteria.length > 0) {
+        idealContent += '\n\n**Anti-Criteria:**\n' + antiCriteria.map((c: string) => `- ${c}`).join('\n');
       }
     }
 
-    // Check if this was significant work (has files changed or was manually created)
+    // Check if this was significant work
     const hasSignificantWork = (
       (workMeta.lineage?.files_changed?.length || 0) > 0 ||
       currentWork.task_count > 1 ||
@@ -336,7 +241,7 @@ async function main() {
     );
 
     if (hasSignificantWork) {
-      writeLearning(workMeta, idealContent);
+      writeLearningEntry(workMeta, idealContent);
     } else {
       console.error('[WorkCompletionLearning] Trivial work session, skipping learning capture');
     }

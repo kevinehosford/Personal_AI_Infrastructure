@@ -2,11 +2,11 @@
  * algorithm-state.ts — Single source of truth for algorithm state management.
  *
  * ALL state writes go through this module. No other code writes to algorithm
- * state files directly.
+ * state directly.
  *
  * Architecture:
- *   Per-session files: MEMORY/STATE/algorithms/{sessionId}.json
- *   One file per session. Multiple runs tracked via phaseHistory resets.
+ *   SQLite-backed via storage.ts — namespace 'algorithms', key = sessionId.
+ *   One row per session. Multiple runs tracked via phaseHistory resets.
  *
  * Writers (1 hook, 1 handler):
  *   AlgorithmTracker (PostToolUse: Bash,TaskCreate,TaskUpdate,Task)
@@ -18,8 +18,13 @@
  *     → Multi-pattern regex extraction + heuristic fallback for effort level
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
-import { join } from 'path';
+import {
+  readState as storageRead,
+  writeState as storageWrite,
+  deleteState as storageDelete,
+  listKeys,
+  readStateWithMeta,
+} from './storage';
 
 // ── Types ──
 
@@ -129,25 +134,18 @@ export interface AlgorithmState {
   mode?: 'loop' | 'interactive' | 'standard';
 }
 
-// ── Paths ──
+// ── Storage namespace ──
 
-const BASE_DIR = process.env.PAI_DIR || join(process.env.HOME!, '.claude');
-const ALGORITHMS_DIR = join(BASE_DIR, 'MEMORY', 'STATE', 'algorithms');
-const SESSION_NAMES_PATH = join(BASE_DIR, 'MEMORY', 'STATE', 'session-names.json');
+const NS = 'algorithms';
 
-function ensureDir(): void {
-  if (!existsSync(ALGORITHMS_DIR)) mkdirSync(ALGORITHMS_DIR, { recursive: true });
-}
+// ── Session names (now SQLite-backed via storage.ts) ──
 
 // ── Read / Write ──
 
 export function readState(sessionId: string): AlgorithmState | null {
   try {
-    const file = join(ALGORITHMS_DIR, `${sessionId}.json`);
-    if (!existsSync(file)) return null;
-    const raw = readFileSync(file, 'utf-8').trim();
-    if (!raw || raw === '{}') return null;
-    return JSON.parse(raw) as AlgorithmState;
+    const state = storageRead<AlgorithmState>(NS, sessionId);
+    return state ?? null;
   } catch {
     return null;
   }
@@ -159,7 +157,6 @@ function isPlaceholderName(name: string): boolean {
 }
 
 export function writeState(state: AlgorithmState): void {
-  ensureDir();
   // Keep effortLevel in sync with sla — UI reads effortLevel preferentially
   state.effortLevel = state.sla;
   // Re-check session-names.json for name updates (placeholder fix + rework rejuvenation)
@@ -167,15 +164,13 @@ export function writeState(state: AlgorithmState): void {
   if (!isPlaceholderName(latestName) && latestName !== state.taskDescription) {
     state.taskDescription = latestName;
   }
-  writeFileSync(join(ALGORITHMS_DIR, `${state.sessionId}.json`), JSON.stringify(state, null, 2));
+  storageWrite(NS, state.sessionId, state);
 }
 
 function getSessionName(sessionId: string): string {
   try {
-    if (existsSync(SESSION_NAMES_PATH)) {
-      const names = JSON.parse(readFileSync(SESSION_NAMES_PATH, 'utf-8'));
-      if (names[sessionId]) return names[sessionId];
-    }
+    const names = storageRead<Record<string, string>>('session-names', 'map');
+    if (names && names[sessionId]) return names[sessionId];
   } catch {}
   return 'Algorithm run';
 }
@@ -436,7 +431,7 @@ export function algorithmEnd(
     return;
   }
 
-  // No state file yet — create one
+  // No state yet — create one
   if (!state) {
     state = {
       active: true,
@@ -496,7 +491,7 @@ export function algorithmEnd(
 }
 
 /**
- * Sweep all algorithm state files and mark stale active sessions as completed.
+ * Sweep all algorithm state entries and mark stale active sessions as completed.
  * Called after every response by the StopOrchestrator handler.
  *
  * Phase-aware thresholds protect long-running work:
@@ -504,7 +499,7 @@ export function algorithmEnd(
  * - THINK/PLAN/VERIFY: 30min (extended reasoning, complex verification)
  * - OBSERVE/LEARN/IDLE/other: 15min (should complete quickly)
  *
- * File mtime is the staleness signal — updated by every tool call hook.
+ * updated_at from SQLite is the staleness signal — updated by every write.
  * Loop items (PRDs) are NOT affected — they use a separate data store.
  */
 const STALE_THRESHOLDS_MS: Record<string, number> = {
@@ -516,32 +511,30 @@ const STALE_THRESHOLDS_MS: Record<string, number> = {
 };
 const DEFAULT_STALE_MS = 15 * 60 * 1000; // 15 min for OBSERVE, LEARN, IDLE, etc.
 
-const DELETE_AGE_MS = 24 * 60 * 60 * 1000; // 24hr: completed files older than this get deleted
+const DELETE_AGE_MS = 24 * 60 * 60 * 1000; // 24hr: completed entries older than this get deleted
 
 export function sweepStaleActive(currentSessionId: string): void {
   try {
-    ensureDir();
-    const { readdirSync, statSync, unlinkSync } = require('fs') as typeof import('fs');
     const now = Date.now();
-    const files = (readdirSync(ALGORITHMS_DIR) as string[]).filter(f => f.endsWith('.json'));
+    const keys = listKeys(NS);
     const liveSessionIds = new Set<string>();
 
-    for (const file of files) {
-      const sid = file.replace('.json', '');
+    for (const sid of keys) {
       if (sid === currentSessionId) continue; // Skip current session — handled by algorithmEnd
 
       try {
-        const filepath = join(ALGORITHMS_DIR, file);
-        const mtime = statSync(filepath).mtimeMs;
-        const age = now - mtime;
+        const meta = readStateWithMeta<AlgorithmState>(NS, sid);
+        if (!meta) continue;
 
-        const state = readState(sid);
-        if (!state) continue;
+        const { value: state, updatedAt } = meta;
+        // Convert SQLite datetime string to ms timestamp
+        const updatedAtMs = new Date(updatedAt + 'Z').getTime();
+        const age = now - updatedAtMs;
 
-        // Delete completed files older than 24 hours — they clutter the directory
+        // Delete completed entries older than 24 hours
         if (!state.active && age > DELETE_AGE_MS) {
           try {
-            unlinkSync(filepath);
+            storageDelete(NS, sid);
             process.stderr.write(`[sweep] deleted ${sid} (completed, age ${Math.round(age / 3600000)}h)\n`);
           } catch {}
           continue;
@@ -570,27 +563,26 @@ export function sweepStaleActive(currentSessionId: string): void {
     // Add current session to live set
     liveSessionIds.add(currentSessionId);
 
-    // Validate + sync session-names.json — repair if corrupted, prune orphans
+    // Validate + sync session-names — repair if corrupted, prune orphans
     try {
-      if (existsSync(SESSION_NAMES_PATH)) {
-        const raw = readFileSync(SESSION_NAMES_PATH, 'utf-8').trim();
-        const names = JSON.parse(raw) as Record<string, string>;
-        const keys = Object.keys(names);
+      const names = storageRead<Record<string, string>>('session-names', 'map');
+      if (names) {
+        const allKeys = Object.keys(names);
         let pruned = 0;
-        for (const key of keys) {
+        for (const key of allKeys) {
           if (!liveSessionIds.has(key)) {
             delete names[key];
             pruned++;
           }
         }
         if (pruned > 0) {
-          writeFileSync(SESSION_NAMES_PATH, JSON.stringify(names, null, 2));
-          process.stderr.write(`[sweep] pruned ${pruned} orphaned entries from session-names.json\n`);
+          storageWrite('session-names', 'map', names);
+          process.stderr.write(`[sweep] pruned ${pruned} orphaned entries from session-names\n`);
         }
       }
     } catch {
-      process.stderr.write(`[sweep] session-names.json corrupt — resetting to {}\n`);
-      writeFileSync(SESSION_NAMES_PATH, '{}');
+      process.stderr.write(`[sweep] session-names corrupt — resetting to {}\n`);
+      storageWrite('session-names', 'map', {});
     }
 
   } catch {}

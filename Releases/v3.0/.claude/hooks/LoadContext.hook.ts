@@ -45,6 +45,12 @@ import { getPaiDir } from './lib/paths';
 import { recordSessionStart } from './lib/notifications';
 import { setTabState, readTabState } from './lib/tab-setter';
 import { getDAName } from './lib/identity';
+import {
+  readState,
+  listWorkSessions,
+  listKeys,
+  queryLogs,
+} from './lib/storage';
 
 /**
  * Reset tab title to clean state at session start.
@@ -149,7 +155,7 @@ interface ProgressFile {
 function loadRelationshipContext(paiDir: string): string | null {
   const parts: string[] = [];
 
-  // Load high-confidence opinions (>0.85) from OPINIONS.md
+  // Load high-confidence opinions (>0.85) from OPINIONS.md (still filesystem — skills, not MEMORY)
   const opinionsPath = join(paiDir, 'skills/PAI/USER/OPINIONS.md');
   if (existsSync(opinionsPath)) {
     try {
@@ -178,42 +184,36 @@ function loadRelationshipContext(paiDir: string): string | null {
     }
   }
 
-  // Load recent relationship notes (today and yesterday)
-  const today = new Date();
-  const yesterday = new Date(today);
-  yesterday.setDate(yesterday.getDate() - 1);
+  // Load recent relationship notes from SQLite (last 10 entries)
+  try {
+    const recentLogs = queryLogs<{
+      date: string;
+      time: string;
+      formatted: string;
+    }>('relationship', { limit: 10 });
 
-  const formatDate = (d: Date) => d.toISOString().split('T')[0];
-  const formatMonth = (d: Date) => d.toISOString().slice(0, 7);
+    if (recentLogs.length > 0) {
+      const notesByDate = new Map<string, string[]>();
+      for (const log of recentLogs) {
+        const date = log.value.date;
+        if (!notesByDate.has(date)) notesByDate.set(date, []);
+        notesByDate.get(date)!.push(`- ${log.value.formatted}`);
+      }
 
-  const recentNotes: string[] = [];
-  for (const date of [today, yesterday]) {
-    const notePath = join(
-      paiDir,
-      'MEMORY/RELATIONSHIP',
-      formatMonth(date),
-      `${formatDate(date)}.md`
-    );
-    if (existsSync(notePath)) {
-      try {
-        const content = readFileSync(notePath, 'utf-8');
-        // Extract just the note lines (starting with -)
-        const notes = content
-          .split('\n')
-          .filter(line => line.trim().startsWith('- '))
-          .slice(0, 5); // Last 5 notes per day
-        if (notes.length > 0) {
-          recentNotes.push(`*${formatDate(date)}:*`);
-          recentNotes.push(...notes);
-        }
-      } catch {}
+      const recentNotes: string[] = [];
+      for (const [date, notes] of notesByDate) {
+        recentNotes.push(`*${date}:*`);
+        recentNotes.push(...notes.slice(0, 5));
+      }
+
+      if (recentNotes.length > 0) {
+        if (parts.length > 0) parts.push('');
+        parts.push('**Recent Relationship Notes:**');
+        parts.push(recentNotes.join('\n'));
+      }
     }
-  }
-
-  if (recentNotes.length > 0) {
-    if (parts.length > 0) parts.push('');
-    parts.push('**Recent Relationship Notes:**');
-    parts.push(recentNotes.join('\n'));
+  } catch (err) {
+    console.error(`⚠️ Failed to load relationship notes from SQLite: ${err}`);
   }
 
   if (parts.length === 0) return null;
@@ -241,133 +241,88 @@ interface WorkSession {
 }
 
 /**
- * Scan recent WORK/ directories (last 48h) for active sessions.
- * Only reads the most recent 20 dirs (sorted by timestamp in dirname).
+ * Query recent active work sessions from SQLite.
  */
 function getRecentWorkSessions(paiDir: string): WorkSession[] {
-  const workDir = join(paiDir, 'MEMORY', 'WORK');
-  if (!existsSync(workDir)) return [];
-
-  // Load session name mapping for clean English titles
-  let sessionNames: Record<string, string> = {};
-  const namesPath = join(paiDir, 'MEMORY', 'STATE', 'session-names.json');
-  try {
-    if (existsSync(namesPath)) {
-      sessionNames = JSON.parse(readFileSync(namesPath, 'utf-8'));
-    }
-  } catch { /* ignore parse errors */ }
-
   const sessions: WorkSession[] = [];
-  const now = Date.now();
-  const cutoff48h = 48 * 60 * 60 * 1000;
-  const seenSessionIds = new Set<string>(); // Dedupe sessions with same ID
 
   try {
-    // Dirs are named YYYYMMDD-HHMMSS_slug — reverse sort = newest first
-    const allDirs = readdirSync(workDir, { withFileTypes: true })
-      .filter(d => d.isDirectory() && /^\d{8}-\d{6}_/.test(d.name))
-      .map(d => d.name)
-      .sort()
-      .reverse()
-      .slice(0, 30); // Check last 30 (some will be filtered)
+    // Load session name mapping from SQLite state
+    const sessionNames = readState<Record<string, string>>('session-names', 'map') || {};
 
-    for (const dirName of allDirs) {
-      // Parse timestamp from dirname: YYYYMMDD-HHMMSS
-      const match = dirName.match(/^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})_(.+)$/);
-      if (!match) continue;
+    // Query active work sessions from SQLite (already sorted by created_at DESC)
+    const activeWorkSessions = listWorkSessions('ACTIVE');
 
-      const [, y, mo, d, h, mi, s, slug] = match;
-      const dirTime = new Date(`${y}-${mo}-${d}T${h}:${mi}:${s}`).getTime();
+    // Filter to last 48h, cap at 8
+    const now = Date.now();
+    const cutoff48h = 48 * 60 * 60 * 1000;
+    const seenSessionIds = new Set<string>();
 
-      // Skip if older than 48h
-      if (now - dirTime > cutoff48h) break; // Sorted newest-first, so we can break
+    for (const ws of activeWorkSessions) {
+      const createdTime = new Date(ws.createdAt).getTime();
+      if (now - createdTime > cutoff48h) continue;
 
-      const dirPath = join(workDir, dirName);
-      const metaPath = join(dirPath, 'META.yaml');
+      const title = ws.title || ws.id;
 
-      if (!existsSync(metaPath)) continue;
+      // Skip noise entries
+      if (title.toLowerCase().startsWith('tasknotification') || title.length < 10) continue;
 
-      try {
-        const meta = readFileSync(metaPath, 'utf-8');
-        const statusMatch = meta.match(/^status:\s*"?(\w+)"?/m);
-        const titleMatch = meta.match(/^title:\s*"?(.+?)"?\s*$/m);
-        const sessionIdMatch = meta.match(/^session_id:\s*"?(.+?)"?\s*$/m);
-        const status = statusMatch?.[1] || 'UNKNOWN';
-        const rawTitle = titleMatch?.[1] || slug.replace(/-/g, ' ');
-        const sessionId = sessionIdMatch?.[1]?.trim();
+      // Dedupe by sessionId
+      if (ws.sessionId && seenSessionIds.has(ws.sessionId)) continue;
+      if (ws.sessionId) seenSessionIds.add(ws.sessionId);
 
-        // Skip completed sessions — only show ACTIVE
-        if (status === 'COMPLETED') continue;
+      // Look up clean session name; fall back to work session title
+      const displayTitle = (ws.sessionId && sessionNames[ws.sessionId]) || title;
 
-        // Skip noise entries (task notifications, very short titles, no session_id)
-        if (rawTitle.toLowerCase().startsWith('tasknotification') || rawTitle.length < 10) continue;
+      if (sessions.length >= 8) break;
 
-        // Dedupe: only show the FIRST (most recent) work dir per session
-        if (sessionId && seenSessionIds.has(sessionId)) continue;
-        if (sessionId) seenSessionIds.add(sessionId);
-
-        // Look up clean session name; fall back to raw title
-        const title = (sessionId && sessionNames[sessionId]) || rawTitle;
-
-        // Cap at 8 recent sessions
-        if (sessions.length >= 8) break;
-
-        // Check for PRD files in this work directory
-        let prd: WorkSession['prd'] = null;
-        try {
-          const files = readdirSync(dirPath).filter(f => f.startsWith('PRD-') && f.endsWith('.md'));
-          if (files.length > 0) {
-            const prdContent = readFileSync(join(dirPath, files[0]), 'utf-8');
-            const prdIdMatch = prdContent.match(/^id:\s*(.+)$/m);
-            const prdStatusMatch = prdContent.match(/^status:\s*(.+)$/m);
-            const prdVerifyMatch = prdContent.match(/^verification_summary:\s*"?(.+?)"?$/m);
-            prd = {
-              id: prdIdMatch?.[1]?.trim() || files[0],
-              status: prdStatusMatch?.[1]?.trim() || 'UNKNOWN',
-              progress: prdVerifyMatch?.[1]?.trim() || '0/0'
-            };
-          }
-        } catch { /* no PRDs */ }
-
-        sessions.push({
-          type: 'recent',
-          name: dirName,
-          title: title.length > 60 ? title.substring(0, 57) + '...' : title,
-          status,
-          timestamp: `${y}-${mo}-${d} ${h}:${mi}`,
-          stale: false,
-          prd
-        });
-      } catch {
-        // Skip malformed
+      // Check meta for PRD info
+      let prd: WorkSession['prd'] = null;
+      const meta = (ws.meta || {}) as Record<string, unknown>;
+      if (meta.prd && typeof meta.prd === 'object') {
+        const prdMeta = meta.prd as Record<string, string>;
+        prd = {
+          id: prdMeta.id || 'unknown',
+          status: prdMeta.status || 'UNKNOWN',
+          progress: prdMeta.progress || '0/0',
+        };
       }
+
+      const timestamp = ws.createdAt.replace('T', ' ').slice(0, 16);
+
+      sessions.push({
+        type: 'recent',
+        name: ws.id,
+        title: displayTitle.length > 60 ? displayTitle.substring(0, 57) + '...' : displayTitle,
+        status: ws.status,
+        timestamp,
+        stale: false,
+        prd,
+      });
     }
   } catch (err) {
-    console.error(`⚠️ Error scanning WORK dirs: ${err}`);
+    console.error(`⚠️ Error querying work sessions: ${err}`);
   }
 
   return sessions;
 }
 
 /**
- * Load persistent project progress files, flagging stale ones (>14 days).
+ * Load persistent project progress from SQLite state, flagging stale ones (>14 days).
  */
 function getProjectProgress(paiDir: string): WorkSession[] {
-  const progressDir = join(paiDir, 'MEMORY', 'STATE', 'progress');
-  if (!existsSync(progressDir)) return [];
-
   const sessions: WorkSession[] = [];
   const now = Date.now();
   const staleThreshold = 14 * 24 * 60 * 60 * 1000;
 
   try {
-    const files = readdirSync(progressDir).filter(f => f.endsWith('-progress.json'));
+    // List all progress keys in the 'progress' namespace
+    const keys = listKeys('progress');
 
-    for (const file of files) {
+    for (const key of keys) {
       try {
-        const content = readFileSync(join(progressDir, file), 'utf-8');
-        const progress = JSON.parse(content) as ProgressFile;
-        if (progress.status !== 'active') continue;
+        const progress = readState<ProgressFile>('progress', key);
+        if (!progress || progress.status !== 'active') continue;
 
         const updatedTime = new Date(progress.updated).getTime();
         const isStale = (now - updatedTime) > staleThreshold;
@@ -388,7 +343,7 @@ function getProjectProgress(paiDir: string): WorkSession[] {
       }
     }
   } catch (err) {
-    console.error(`⚠️ Error reading progress files: ${err}`);
+    console.error(`⚠️ Error reading progress from SQLite: ${err}`);
   }
 
   return sessions;

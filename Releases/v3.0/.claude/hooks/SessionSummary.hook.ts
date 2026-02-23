@@ -48,26 +48,9 @@
  * - Typical execution: <50ms
  */
 
-import { writeFileSync, existsSync, readFileSync, unlinkSync } from 'fs';
-import { join } from 'path';
 import { getISOTimestamp } from './lib/time';
 import { setTabState, cleanupKittySession } from './lib/tab-setter';
-
-const BASE_DIR = process.env.PAI_DIR || join(process.env.HOME!, '.claude');
-const MEMORY_DIR = join(BASE_DIR, 'MEMORY');
-const STATE_DIR = join(MEMORY_DIR, 'STATE');
-const WORK_DIR = join(MEMORY_DIR, 'WORK');
-
-// Session-scoped state file lookup with legacy fallback
-function findStateFile(sessionId?: string): string | null {
-  if (sessionId) {
-    const scoped = join(STATE_DIR, `current-work-${sessionId}.json`);
-    if (existsSync(scoped)) return scoped;
-  }
-  const legacy = join(STATE_DIR, 'current-work.json');
-  if (existsSync(legacy)) return legacy;
-  return null;
-}
+import { readState, deleteState, completeWorkSession } from './lib/storage';
 
 interface CurrentWork {
   session_id: string;
@@ -79,40 +62,44 @@ interface CurrentWork {
 }
 
 /**
- * Mark work directory as completed and clear session state
+ * Mark work session as completed and clear session state
  */
 function clearSessionWork(sessionId?: string): void {
   try {
-    const stateFile = findStateFile(sessionId);
-    if (!stateFile) {
+    // Read current work state from SQLite (session-scoped with legacy fallback)
+    let currentWork: CurrentWork | null = null;
+    if (sessionId) {
+      currentWork = readState<CurrentWork>('current-work', sessionId);
+    }
+    if (!currentWork) {
+      currentWork = readState<CurrentWork>('current-work', 'legacy');
+    }
+
+    if (!currentWork) {
       console.error('[SessionSummary] No current work to complete');
       return;
     }
 
-    // Read current work state
-    const content = readFileSync(stateFile, 'utf-8');
-    const currentWork: CurrentWork = JSON.parse(content);
-
     // Guard: don't process another session's state
     if (sessionId && currentWork.session_id !== sessionId) {
-      console.error('[SessionSummary] State file belongs to different session, skipping');
+      console.error('[SessionSummary] State belongs to different session, skipping');
       return;
     }
 
-    // Mark work directory as COMPLETED
+    // Mark work session as COMPLETED in SQLite
     if (currentWork.session_dir) {
-      const metaPath = join(WORK_DIR, currentWork.session_dir, 'META.yaml');
-      if (existsSync(metaPath)) {
-        let metaContent = readFileSync(metaPath, 'utf-8');
-        metaContent = metaContent.replace(/^status: "ACTIVE"$/m, 'status: "COMPLETED"');
-        metaContent = metaContent.replace(/^completed_at: null$/m, `completed_at: "${getISOTimestamp()}"`);
-        writeFileSync(metaPath, metaContent, 'utf-8');
-        console.error(`[SessionSummary] Marked work directory as COMPLETED: ${currentWork.session_dir}`);
-      }
+      completeWorkSession(currentWork.session_dir, {
+        status: 'COMPLETED',
+        completed_at: getISOTimestamp(),
+      });
+      console.error(`[SessionSummary] Marked work session as COMPLETED: ${currentWork.session_dir}`);
     }
 
-    // Delete state file
-    unlinkSync(stateFile);
+    // Delete state entries
+    if (sessionId) {
+      deleteState('current-work', sessionId);
+    }
+    deleteState('current-work', 'legacy');
     console.error('[SessionSummary] Cleared session work state');
   } catch (error) {
     console.error(`[SessionSummary] Error clearing session work: ${error}`);

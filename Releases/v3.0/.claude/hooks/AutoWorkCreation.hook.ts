@@ -11,7 +11,11 @@
  *
  * TRIGGER: UserPromptSubmit
  *
- * STRUCTURE CREATED:
+ * STORAGE:
+ * Primary: SQLite via storage.ts (work_sessions, work_tasks, state tables)
+ * Secondary: Filesystem WORK/ directories for backward compat with LoadContext, WorkCompletionLearning
+ *
+ * FILESYSTEM STRUCTURE (backward compat):
  * WORK/{timestamp}_{session-title}/
  * ├── META.yaml                    # Session metadata
  * ├── tasks/
@@ -22,10 +26,18 @@
  * └── scratch/                     # Temporary files
  */
 
-import { mkdirSync, existsSync, readFileSync, writeFileSync, symlinkSync, unlinkSync, lstatSync } from 'fs';
+import { mkdirSync, existsSync, writeFileSync, symlinkSync, unlinkSync, lstatSync } from 'fs';
 import { join } from 'path';
 import { getPSTComponents, getISOTimestamp } from './lib/time';
 import { generatePRDTemplate, generatePRDFilename } from './lib/prd-template';
+import { paiPath } from './lib/paths';
+import {
+  readState as storageRead,
+  writeState as storageWrite,
+  createWorkSession,
+  createWorkTask,
+} from './lib/storage';
+
 interface HookInput {
   session_id: string;
   prompt?: string;
@@ -49,16 +61,7 @@ interface PromptClassification {
   is_new_topic: boolean;
 }
 
-const BASE_DIR = process.env.PAI_DIR || join(process.env.HOME!, '.claude');
-const WORK_DIR = join(BASE_DIR, 'MEMORY', 'WORK');
-const STATE_DIR = join(BASE_DIR, 'MEMORY', 'STATE');
-// Session-scoped state files prevent parallel sessions from overwriting each other
-function currentWorkFile(sessionId?: string): string {
-  if (sessionId) return join(STATE_DIR, `current-work-${sessionId}.json`);
-  return join(STATE_DIR, 'current-work.json'); // legacy fallback
-}
-
-// No more inference — simple heuristic classification
+const WORK_DIR = paiPath('MEMORY', 'WORK');
 
 async function readStdinWithTimeout(timeout: number = 5000): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -72,25 +75,19 @@ async function readStdinWithTimeout(timeout: number = 5000): Promise<string> {
 
 function readCurrentWork(sessionId?: string): CurrentWork | null {
   try {
-    // Try session-scoped file first, fall back to legacy
-    const scopedFile = sessionId ? currentWorkFile(sessionId) : null;
-    if (scopedFile && existsSync(scopedFile)) {
-      return JSON.parse(readFileSync(scopedFile, 'utf-8'));
+    // Try session-scoped key first, fall back to legacy
+    if (sessionId) {
+      const scoped = storageRead<CurrentWork>('current-work', sessionId);
+      if (scoped) return scoped;
     }
-    const legacyFile = currentWorkFile();
-    if (existsSync(legacyFile)) {
-      return JSON.parse(readFileSync(legacyFile, 'utf-8'));
-    }
-    return null;
+    return storageRead<CurrentWork>('current-work', 'legacy') ?? null;
   } catch {
     return null;
   }
 }
 
 function writeCurrentWork(state: CurrentWork): void {
-  if (!existsSync(STATE_DIR)) mkdirSync(STATE_DIR, { recursive: true });
-  // Write to session-scoped file
-  writeFileSync(currentWorkFile(state.session_id), JSON.stringify(state, null, 2), 'utf-8');
+  storageWrite('current-work', state.session_id, state);
 }
 
 function slugify(text: string, maxLen: number = 40): string {
@@ -110,34 +107,46 @@ function generateSessionDirName(title: string): string {
 }
 
 /**
- * Create session directory structure
+ * Create session directory structure + SQLite work_sessions record.
+ * Filesystem structure kept for backward compatibility with LoadContext, WorkCompletionLearning.
  */
 function createSessionDirectory(sessionDirName: string, sessionId: string, title: string): string {
   const sessionPath = join(WORK_DIR, sessionDirName);
   const timestamp = getISOTimestamp();
 
-  // Create session structure
+  // Create session structure (still needed for PRD files and other hooks)
   mkdirSync(join(sessionPath, 'tasks'), { recursive: true });
   mkdirSync(join(sessionPath, 'scratch'), { recursive: true });
 
-  // Session META.yaml
-  const meta = `id: "${sessionDirName}"
+  // Session META.yaml (backward compat for hooks that still read filesystem)
+  const metaYaml = `id: "${sessionDirName}"
 title: "${title}"
 session_id: "${sessionId}"
 created_at: "${timestamp}"
 completed_at: null
 status: "ACTIVE"
 `;
-  writeFileSync(join(sessionPath, 'META.yaml'), meta, 'utf-8');
+  writeFileSync(join(sessionPath, 'META.yaml'), metaYaml, 'utf-8');
+
+  // Store in SQLite (primary record)
+  createWorkSession({
+    id: sessionDirName,
+    sessionId,
+    title,
+    meta: { created_at: timestamp, status: 'ACTIVE' },
+  });
 
   console.error(`[AutoWork] Created session: ${sessionPath}`);
   return sessionPath;
 }
 
 /**
- * Create task directory with ISC.json and THREAD.md (with frontmatter metadata)
+ * Create task directory with ISC.json and THREAD.md (with frontmatter metadata).
+ * Also stores task data in SQLite via createWorkTask().
+ * Filesystem files kept for backward compatibility with other hooks.
  */
 function createTaskDirectory(
+  sessionDirName: string,
   sessionPath: string,
   taskNumber: number,
   title: string,
@@ -152,7 +161,7 @@ function createTaskDirectory(
 
   mkdirSync(taskPath, { recursive: true });
 
-  // Task THREAD.md with frontmatter metadata (no separate META.yaml)
+  // Task THREAD.md with frontmatter metadata (backward compat for filesystem consumers)
   const thread = `---
 taskId: "${taskDirName}"
 title: "${title}"
@@ -167,25 +176,25 @@ prompt: |
 
 ## Phase Log
 
-### 👀 OBSERVE Phase
+### OBSERVE Phase
 _Pending..._
 
-### 🧠 THINK Phase
+### THINK Phase
 _Pending..._
 
-### 📋 PLAN Phase
+### PLAN Phase
 _Pending..._
 
-### 🔨 BUILD Phase
+### BUILD Phase
 _Pending..._
 
-### ▶️ EXECUTE Phase
+### EXECUTE Phase
 _Pending..._
 
-### ✅ VERIFY Phase
+### VERIFY Phase
 _Pending..._
 
-### 🎓 LEARN Phase
+### LEARN Phase
 _Pending..._
 
 ---
@@ -202,7 +211,7 @@ _Important observations during execution..._
 `;
   writeFileSync(join(taskPath, 'THREAD.md'), thread, 'utf-8');
 
-  // Task ISC.json with proper scaffold
+  // Task ISC.json with proper scaffold (backward compat for filesystem consumers)
   const isc = {
     taskId: taskDirName,
     status: 'PENDING',
@@ -226,7 +235,7 @@ _Important observations during execution..._
   });
   writeFileSync(join(taskPath, prdFilename), prdContent, 'utf-8');
 
-  // Update 'current' symlink
+  // Update 'current' symlink (backward compat — queryable via SQL now)
   const currentLink = join(sessionPath, 'tasks', 'current');
   try {
     if (existsSync(currentLink) || lstatSync(currentLink)) {
@@ -234,6 +243,15 @@ _Important observations during execution..._
     }
   } catch { /* ignore if doesn't exist */ }
   symlinkSync(taskDirName, currentLink);
+
+  // Store in SQLite (primary record)
+  createWorkTask({
+    sessionId: sessionDirName,
+    taskNumber,
+    slug: taskSlug,
+    isc,
+    thread,
+  });
 
   console.error(`[AutoWork] Created task: ${taskPath}`);
   console.error(`[AutoWork] Created PRD: ${prdFilename}`);
@@ -299,6 +317,7 @@ async function main() {
       const sessionPath = createSessionDirectory(sessionDirName, sessionId, title);
 
       const { taskDirName, prdPath } = createTaskDirectory(
+        sessionDirName,
         sessionPath,
         1,
         title,
@@ -325,6 +344,7 @@ async function main() {
       const title = classification.title || prompt.substring(0, 50);
 
       const { taskDirName, prdPath } = createTaskDirectory(
+        currentWork!.session_dir,
         sessionPath,
         newTaskNumber,
         title,

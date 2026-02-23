@@ -17,7 +17,7 @@
  *
  * LOGIC:
  * - If session has a customTitle in sessions-index.json (set by /rename) → use that
- * - If session already has a name in session-names.json → skip (no overwrite)
+ * - If session already has a name in SQLite (session-names/map) → skip (no overwrite)
  * - If no name exists → generate one via fast inference → store it
  * - Names persist across session lifecycle, surviving compaction/restore
  *
@@ -25,9 +25,10 @@
  * This hook generates a fallback name only when no customTitle exists.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
-import { dirname } from 'path';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { paiPath } from './lib/paths';
+import { readState as storageRead, writeState as storageWrite } from './lib/storage';
+import { readState as readAlgoState, writeState as writeAlgoState } from './lib/algorithm-state';
 import { inference } from '../skills/PAI/Tools/Inference';
 
 interface HookInput {
@@ -36,29 +37,23 @@ interface HookInput {
   user_prompt?: string;
 }
 
-const SESSION_NAMES_PATH = paiPath('MEMORY', 'STATE', 'session-names.json');
-
 interface SessionNames {
   [sessionId: string]: string;
 }
 
+const SESSION_NAMES_NS = 'session-names';
+const SESSION_NAMES_KEY = 'map';
+
 function readSessionNames(): SessionNames {
   try {
-    if (existsSync(SESSION_NAMES_PATH)) {
-      return JSON.parse(readFileSync(SESSION_NAMES_PATH, 'utf-8'));
-    }
+    return storageRead<SessionNames>(SESSION_NAMES_NS, SESSION_NAMES_KEY) ?? {};
   } catch {
-    // Corrupted file — start fresh
+    return {};
   }
-  return {};
 }
 
 function writeSessionNames(names: SessionNames): void {
-  const dir = dirname(SESSION_NAMES_PATH);
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true });
-  }
-  writeFileSync(SESSION_NAMES_PATH, JSON.stringify(names, null, 2), 'utf-8');
+  storageWrite(SESSION_NAMES_NS, SESSION_NAMES_KEY, names);
 }
 
 const NAME_PROMPT = `You are labeling a folder. Give this conversation a 2-3 word Topic Case title.
@@ -262,11 +257,10 @@ async function main() {
   let isRework = false;
 
   if (names[sessionId]) {
-    // Check algorithm state for rework signal
+    // Check algorithm state for rework signal (reads from SQLite via storage.ts)
     try {
-      const algoStatePath = paiPath('MEMORY', 'STATE', 'algorithms', `${sessionId}.json`);
-      if (existsSync(algoStatePath)) {
-        const algoState = JSON.parse(readFileSync(algoStatePath, 'utf-8'));
+      const algoState = readAlgoState(sessionId);
+      if (algoState) {
         const isComplete = !algoState.active ||
           algoState.currentPhase === 'COMPLETE' ||
           algoState.currentPhase === 'LEARN' ||
@@ -300,15 +294,14 @@ async function main() {
     // On rework, record the previous name in algorithm state for dashboard display
     if (isRework && names[sessionId]) {
       try {
-        const algoStatePath = paiPath('MEMORY', 'STATE', 'algorithms', `${sessionId}.json`);
-        if (existsSync(algoStatePath)) {
-          const algoState = JSON.parse(readFileSync(algoStatePath, 'utf-8'));
+        const algoState = readAlgoState(sessionId);
+        if (algoState) {
           if (!algoState.previousNames) algoState.previousNames = [];
           algoState.previousNames.push({
             name: names[sessionId],
             changedAt: new Date().toISOString(),
           });
-          writeFileSync(algoStatePath, JSON.stringify(algoState, null, 2));
+          writeAlgoState(algoState);
           console.error(`[SessionAutoName] Archived previous name: "${names[sessionId]}"`);
         }
       } catch (err) {
@@ -318,6 +311,7 @@ async function main() {
 
     names[sessionId] = label;
     writeSessionNames(names);
+    // session-name-cache.sh is a shell integration file — keep as filesystem write
     const cacheContent = `cached_session_id='${sessionId}'\ncached_session_label='${label}'\n`;
     const cachePath = paiPath('MEMORY', 'STATE', 'session-name-cache.sh');
     writeFileSync(cachePath, cacheContent, 'utf-8');
